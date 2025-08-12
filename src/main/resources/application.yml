@@ -1,0 +1,118 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/nexsplit
+    username: postgres
+    password: ${DB_PASSWORD:Viraj@2002} # Use environment variable with fallback for development
+  #    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: none # Managed by Flyway
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+  flyway:
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+  security:
+    oauth2:
+      client:
+        registration:
+          google:
+            client-id: ${GOOGLE_CLIENT_ID:google-client-id}
+            client-secret: ${GOOGLE_CLIENT_SECRET:google-client-secret}
+            scope: profile,email
+            redirect-uri: http://localhost:8080/login/oauth2/code/google
+        provider:
+          google:
+            authorization-uri: https://accounts.google.com/o/oauth2/auth
+            token-uri: https://oauth2.googleapis.com/token
+            user-info-uri: https://www.googleapis.com/oauth2/v3/userinfo
+            user-name-attribute: email
+
+server:
+  port: 8080
+
+jwt:
+  secret: ${JWT_SECRET:X7k9pL2mQ4jR8vT6yB3nF1cD5hG9jL4kP8mQ2vT6yB3nF1cD5h} # Use environment variable with fallback
+  access-token:
+    expiration-minutes: ${JWT_ACCESS_TOKEN_EXPIRATION:15} # 15 minutes for security
+  refresh-token:
+    expiration-days: ${JWT_REFRESH_TOKEN_EXPIRATION:7} # 7 days with rotation
+    max-family-size: ${JWT_REFRESH_TOKEN_MAX_FAMILY_SIZE:10} # Max tokens per family
+    max-concurrent-sessions: ${JWT_REFRESH_TOKEN_MAX_CONCURRENT_SESSIONS:5} # Max concurrent sessions per user
+
+logging:
+  file:
+    name: logs/nexsplit.log
+  level:
+    com.nexsplit: DEBUG
+    org.springframework.security: DEBUG
+
+# ========================================
+# SWAGGER/OPENAPI CONFIGURATION
+# ========================================
+springdoc:
+  # API documentation path
+  api-docs:
+    path: /v3/api-docs
+  # Swagger UI configuration
+  swagger-ui:
+    path: /swagger-ui.html
+    # Enable the "Authorize" button
+    display-request-duration: true
+    # Show operation ID
+    display-operation-id: true
+    # Custom CSS for better styling
+    custom-css: |
+      .swagger-ui .auth-wrapper {
+        margin: 20px 0;
+      }
+      .swagger-ui .auth-container {
+        background: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 4px;
+        padding: 15px;
+      }
+    # Custom JavaScript for better UX
+    custom-js: |
+      window.onload = function() {
+        // Auto-focus on the authorize button
+        setTimeout(function() {
+          const authBtn = document.querySelector('.auth-wrapper .btn.authorize');
+          if (authBtn) {
+            authBtn.style.backgroundColor = '#007bff';
+            authBtn.style.color = 'white';
+          }
+        }, 1000);
+      };
+  # Show all endpoints including those without @Operation annotation
+  default-produces-media-type: application/json
+  default-consumes-media-type: application/json
+#security:
+#  cors:
+#    allow-credentials: true
+#    allowed-origins:
+#      - http://localhost:3000
+#      - http://127.0.0.1:3000
+#    allowed-methods:
+#      - GET
+#      - POST
+#      - PUT
+#      - PATCH
+#      - DELETE
+#      - OPTIONS
+#    allowed-headers:
+#      - Authorization
+#      - Origin
+#      - Content-Type
+#      - Accept
+#      - Accept-Encoding
+#      - Accept-Language
+#      - Access-Control-Allow-Origin
+#      - Access-Control-Allow-Headers
+#      - Access-Control-Request-Method
+#      - X-Requested-With
+#      - X-Auth-Token
+#      - X-Xsrf-Token
+#      - Cache-Control
+#      - Id-Token

@@ -1,1 +1,2 @@
-# nex-split-backend-expd
+# nexsplit
+Expense tracker for individual and shared/splitted expenses.

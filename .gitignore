@@ -19,8 +19,14 @@ target/
 *.iml
 *.ipr
 *.java~
-*.xml~
-*.md~
+*.sql~
+# Log files
+*.log
+*.log.*
+*.log.gz
+*.log.zip
+/logs/
+logs/
 
 ### NetBeans ###
 /nbproject/private/
@@ -34,3 +40,12 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Environment Files ###
+# Exclude all environment files to prevent secrets from being committed
+.env
+.env.local
+.env.development
+.env.staging
+.env.production
+*.env
