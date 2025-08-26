@@ -2,12 +2,18 @@ package com.nexsplit.controller;
 
 import com.nexsplit.dto.auth.AuthResponse;
 import com.nexsplit.dto.auth.LoginRequest;
+import com.nexsplit.dto.auth.OAuth2TokenRequest;
 import com.nexsplit.dto.auth.RefreshTokenRequest;
+import com.nexsplit.dto.auth.RefreshTokenResponse;
 import com.nexsplit.dto.user.UserDto;
 import com.nexsplit.exception.SecurityException;
+import com.nexsplit.exception.UserNotFoundException;
 import com.nexsplit.model.User;
-import com.nexsplit.service.RefreshTokenService;
-import com.nexsplit.service.UserService;
+import com.nexsplit.service.AuditService;
+import com.nexsplit.service.EmailService;
+import com.nexsplit.service.OAuth2Service;
+import com.nexsplit.service.impl.RefreshTokenServiceImpl;
+import com.nexsplit.service.impl.UserServiceImpl;
 import com.nexsplit.config.ApiConfig;
 import com.nexsplit.util.JwtUtil;
 import io.swagger.v3.oas.annotations.Operation;
@@ -15,14 +21,11 @@ import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.ExampleObject;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
-import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.security.SecurityRequirement;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.Valid;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseCookie;
@@ -30,80 +33,85 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.core.oidc.user.OidcUser;
 import org.springframework.web.bind.annotation.*;
+import com.nexsplit.util.LoggingUtil;
+import com.nexsplit.util.StructuredLoggingUtil;
+import lombok.extern.slf4j.Slf4j;
 
 import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 @RestController
 @RequestMapping(ApiConfig.API_BASE_PATH + "/auth")
 @Tag(name = "Authentication", description = "Authentication and authorization endpoints")
+@Slf4j
 public class AuthController {
 
-        private static final Logger logger = LoggerFactory.getLogger(AuthController.class);
-
-        private final UserService userService;
-        private final RefreshTokenService refreshTokenService;
+        private final UserServiceImpl userServiceImpl;
+        private final RefreshTokenServiceImpl refreshTokenServiceImpl;
         private final JwtUtil jwtUtil;
+        private final AuditService auditService;
+        private final OAuth2Service oauth2Service;
+        private final EmailService emailService;
 
-        public AuthController(UserService userService, RefreshTokenService refreshTokenService, JwtUtil jwtUtil) {
-                this.userService = userService;
-                this.refreshTokenService = refreshTokenService;
+        public AuthController(UserServiceImpl userServiceImpl, RefreshTokenServiceImpl refreshTokenServiceImpl,
+                        JwtUtil jwtUtil, AuditService auditService, OAuth2Service oauth2Service,
+                        EmailService emailService) {
+                this.userServiceImpl = userServiceImpl;
+                this.refreshTokenServiceImpl = refreshTokenServiceImpl;
                 this.jwtUtil = jwtUtil;
+                this.auditService = auditService;
+                this.oauth2Service = oauth2Service;
+                this.emailService = emailService;
         }
 
-        @GetMapping("/oauth-login")
-        @Operation(summary = "OAuth2 Login Callback", description = "Callback endpoint for Google OAuth2 authentication. This endpoint is called by Spring Security after successful OAuth2 authentication.", responses = {
-                        @ApiResponse(responseCode = "200", description = "OAuth2 login successful", content = @Content(mediaType = "application/json", schema = @Schema(implementation = AuthResponse.class), examples = @ExampleObject(name = "Successful OAuth2 Login", value = """
-                                        {
-                                          "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-                                          "tokenType": "Bearer",
-                                          "refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-                                          "expiresIn": 900,
-                                          "email": "user@gmail.com",
-                                          "fullName": "John Doe"
-                                        }
-                                        """))),
-                        @ApiResponse(responseCode = "401", description = "OAuth2 authentication failed")
+        @PostMapping("/oauth2/verify")
+        @Operation(summary = "OAuth2 Token Exchange", description = "Verify Google OAuth2 token and return JWT tokens. Used by mobile apps and web apps that handle OAuth2 on the frontend.", requestBody = @io.swagger.v3.oas.annotations.parameters.RequestBody(description = "OAuth2 token exchange request", required = true, content = @Content(mediaType = "application/json", schema = @Schema(implementation = OAuth2TokenRequest.class), examples = @ExampleObject(name = "OAuth2 Token Exchange", value = """
+                        {
+                          "googleToken": "ya29.a0AfB_byC..."
+                        }
+                        """))), responses = {
+                        @ApiResponse(responseCode = "200", description = "OAuth2 token verification successful", content = @Content(mediaType = "application/json", schema = @Schema(implementation = AuthResponse.class))),
+                        @ApiResponse(responseCode = "400", description = "Invalid request data"),
+                        @ApiResponse(responseCode = "401", description = "Invalid Google OAuth2 token")
         })
-        public ResponseEntity<AuthResponse> oauthLogin(@AuthenticationPrincipal OidcUser oidcUser,
-                        HttpServletRequest request, HttpServletResponse response) {
-                User user = userService.processOAuthUser(oidcUser);
-                String accessToken = userService.generateAccessToken(user);
+        public ResponseEntity<AuthResponse> verifyOAuth2Token(@Valid @RequestBody OAuth2TokenRequest request,
+                        HttpServletRequest httpRequest, HttpServletResponse response) {
+                try {
+                        // Get client IP address for security tracking
+                        String ipAddress = getClientIpAddress(httpRequest);
+                        String userAgent = httpRequest.getHeader("User-Agent");
 
-                // Get client information for security tracking
-                String ipAddress = getClientIpAddress(request);
-                String userAgent = request.getHeader("User-Agent");
+                        // Verify OAuth2 token and get JWT tokens
+                        AuthResponse authResponse = oauth2Service.verifyOAuth2Token(request, ipAddress, userAgent);
 
-                // Generate secure refresh token with family tracking
-                String refreshToken = refreshTokenService.generateRefreshToken(user.getId(), ipAddress, userAgent);
+                        // Set refresh token as a secure cookie
+                        ResponseCookie refreshCookie = ResponseCookie
+                                        .from("refreshToken", authResponse.getRefreshToken())
+                                        .httpOnly(true)
+                                        .secure(true)
+                                        .path(ApiConfig.API_BASE_PATH)
+                                        .maxAge(Duration.ofDays(7))
+                                        .sameSite("Strict")
+                                        .build();
 
-                logger.info("OAuth2 login successful for user: {}", user.getEmail());
+                        response.setHeader(HttpHeaders.SET_COOKIE, refreshCookie.toString());
 
-                // Set refresh token as a cookie
-                ResponseCookie refreshCookie = ResponseCookie.from("refreshToken", refreshToken)
-                                .httpOnly(true)
-                                .secure(true)
-                                .path(ApiConfig.API_BASE_PATH)
-                                .maxAge(Duration.ofDays(7))
-                                .sameSite("Strict")
-                                .build();
+                        log.info("OAuth2 token verification successful");
+                        return ResponseEntity.ok(authResponse);
 
-                response.setHeader(HttpHeaders.SET_COOKIE, refreshCookie.toString());
-
-                AuthResponse authResponse = AuthResponse.builder()
-                                .accessToken(accessToken)
-                                .tokenType("Bearer")
-                                .refreshToken(refreshToken)
-                                .expiresIn(900L) // 15 minutes
-                                .email(user.getEmail())
-                                .fullName(user.getFullName())
-                                .build();
-
-                return ResponseEntity.ok(authResponse);
+                } catch (Exception e) {
+                        log.error("OAuth2 token verification failed: {}", e.getMessage(), e);
+                        return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                                        .body(AuthResponse.builder()
+                                                        .error("OAuth2 token verification failed")
+                                                        .build());
+                }
         }
 
         @PostMapping("/register")
-        @Operation(summary = "Register New User", description = "Register a new user account with email and password authentication.", requestBody = @io.swagger.v3.oas.annotations.parameters.RequestBody(description = "User registration data", required = true, content = @Content(mediaType = "application/json", schema = @Schema(implementation = UserDto.class), examples = @ExampleObject(name = "User Registration", value = """
+        @Operation(summary = "Register New User", description = "Register a new user account with email and password authentication. Email verification is required before login.", requestBody = @io.swagger.v3.oas.annotations.parameters.RequestBody(description = "User registration data", required = true, content = @Content(mediaType = "application/json", schema = @Schema(implementation = UserDto.class), examples = @ExampleObject(name = "User Registration", value = """
                         {
                           "email": "john.doe@example.com",
                           "password": "StrongPass123!",
@@ -113,51 +121,45 @@ public class AuthController {
                           "contactNumber": "+1234567890"
                         }
                         """))), responses = {
-                        @ApiResponse(responseCode = "200", description = "User registered successfully", content = @Content(mediaType = "application/json", schema = @Schema(implementation = AuthResponse.class))),
+                        @ApiResponse(responseCode = "200", description = "User registered successfully. Check email for verification code."),
                         @ApiResponse(responseCode = "400", description = "Invalid input data or user already exists")
         })
-        public ResponseEntity<AuthResponse> register(@Valid @RequestBody UserDto userDto,
-                        HttpServletRequest request, HttpServletResponse response) {
-                String email = userDto.getEmail();
-                String password = userDto.getPassword();
-                String firstName = userDto.getFirstName();
-                String lastName = userDto.getLastName();
-                String username = userDto.getUsername();
-                String contactNumber = userDto.getContactNumber();
-
-                User user = userService.registerUser(email, password, firstName, lastName, username, contactNumber);
-
-                String accessToken = userService.generateAccessToken(user);
+        public ResponseEntity<Map<String, Object>> register(@Valid @RequestBody UserDto userDto,
+                        HttpServletRequest request) {
+                User user = userServiceImpl.registerUser(userDto);
 
                 // Get client information for security tracking
                 String ipAddress = getClientIpAddress(request);
                 String userAgent = request.getHeader("User-Agent");
 
-                // Generate secure refresh token with family tracking
-                String refreshToken = refreshTokenService.generateRefreshToken(user.getId(), ipAddress, userAgent);
+                // Log audit event asynchronously
+                auditService.logAuthenticationEventAsync(user.getId(), "USER_REGISTRATION_SUCCESS", ipAddress,
+                                userAgent, "User registration successful - email verification pending");
 
-                logger.info("User registered successfully: {}", email);
+                // Log business event for Elasticsearch
+                StructuredLoggingUtil.logBusinessEvent(
+                                "USER_REGISTRATION",
+                                user.getEmail(),
+                                "CREATE_ACCOUNT",
+                                "SUCCESS",
+                                Map.of(
+                                                "source", "WEB",
+                                                "ipAddress", ipAddress,
+                                                "userAgent", userAgent,
+                                                "userType", "REGULAR",
+                                                "emailVerified", false));
 
-                ResponseCookie refreshCookie = ResponseCookie.from("refreshToken", refreshToken)
-                                .httpOnly(true)
-                                .secure(true)
-                                .path(ApiConfig.API_BASE_PATH)
-                                .maxAge(Duration.ofDays(7))
-                                .sameSite("Strict")
-                                .build();
+                log.info("User registered successfully: {} - Email verification required",
+                                LoggingUtil.maskEmail(user.getEmail()));
 
-                response.setHeader(HttpHeaders.SET_COOKIE, refreshCookie.toString());
-
-                AuthResponse authResponse = AuthResponse.builder()
-                                .accessToken(accessToken)
-                                .tokenType("Bearer")
-                                .refreshToken(refreshToken)
-                                .expiresIn(900L) // 15 minutes
-                                .email(user.getEmail())
-                                .fullName(user.getFullName())
-                                .build();
-
-                return ResponseEntity.ok(authResponse);
+                return ResponseEntity.ok(Map.of(
+                                "success", true,
+                                "message", "Registration successful! Please check your email for verification code.",
+                                "data", Map.of(
+                                                "email", user.getEmail(),
+                                                "username", user.getUsername(),
+                                                "emailVerified", false,
+                                                "nextStep", "Verify your email to complete registration")));
         }
 
         @PostMapping("/login")
@@ -175,19 +177,39 @@ public class AuthController {
                 String email = loginRequest.getEmail();
                 String password = loginRequest.getPassword();
 
-                String accessToken = userService.loginUser(email, password);
+                String accessToken = userServiceImpl.loginUser(email, password);
 
                 // Get user ID for refresh token generation
-                User user = userService.getUserByEmail(email);
+                UserDto user = userServiceImpl.getUserByEmail(email);
 
                 // Get client information for security tracking
                 String ipAddress = getClientIpAddress(request);
                 String userAgent = request.getHeader("User-Agent");
 
                 // Generate secure refresh token with family tracking
-                String refreshToken = refreshTokenService.generateRefreshToken(user.getId(), ipAddress, userAgent);
+                String refreshToken = refreshTokenServiceImpl.generateRefreshToken(user.getId(), userAgent);
 
-                logger.info("Email/password login successful for user: {}", email);
+                // Log business event for Elasticsearch
+                StructuredLoggingUtil.logBusinessEvent(
+                                "USER_LOGIN",
+                                email,
+                                "AUTHENTICATE",
+                                "SUCCESS",
+                                Map.of(
+                                                "source", "WEB",
+                                                "ipAddress", ipAddress,
+                                                "userAgent", userAgent,
+                                                "authMethod", "EMAIL_PASSWORD"));
+
+                log.info("Email/password login successful for user: {}", LoggingUtil.maskEmail(email));
+
+                // Log authentication event asynchronously
+                auditService.logAuthenticationEventAsync(
+                                user.getId(),
+                                "LOGIN_SUCCESS",
+                                getClientIpAddress(request),
+                                request.getHeader("User-Agent"),
+                                "Email/password login successful");
 
                 ResponseCookie refreshCookie = ResponseCookie.from("refreshToken", refreshToken)
                                 .httpOnly(true)
@@ -221,7 +243,7 @@ public class AuthController {
                         HttpServletRequest request,
                         HttpServletResponse response) {
                 if (refreshToken == null || refreshToken.isEmpty()) {
-                        logger.warn("Refresh token not found in cookies");
+                        log.warn("Refresh token not found in cookies");
                         return ResponseEntity.badRequest().build();
                 }
 
@@ -231,10 +253,10 @@ public class AuthController {
                         String userAgent = request.getHeader("User-Agent");
 
                         // Use the secure refresh token service with theft detection
-                        RefreshTokenService.RefreshTokenResponse tokenResponse = refreshTokenService
+                        RefreshTokenResponse tokenResponse = refreshTokenServiceImpl
                                         .refreshAccessToken(refreshToken, ipAddress, userAgent);
 
-                        logger.info("Token refreshed successfully");
+                        log.info("Token refreshed successfully");
 
                         // Clear the old refresh token cookie
                         ResponseCookie clearCookie = ResponseCookie.from("refreshToken", "")
@@ -264,14 +286,14 @@ public class AuthController {
 
                         return ResponseEntity.ok(authResponse);
                 } catch (SecurityException e) {
-                        logger.error("Security violation during token refresh: {}", e.getMessage());
+                        log.error("Security violation during token refresh: {}", e.getMessage());
                         return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                                         .body(AuthResponse.builder()
                                                         .error("Security violation detected - please re-authenticate"
                                                                         + " " + e.getMessage())
                                                         .build());
                 } catch (Exception e) {
-                        logger.warn("Failed to refresh token: {}", e.getMessage());
+                        log.warn("Failed to refresh token: {}", e.getMessage());
                         return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
                 }
         }
@@ -330,10 +352,10 @@ public class AuthController {
                         String userAgent = request.getHeader("User-Agent");
 
                         // Use the secure refresh token service with theft detection
-                        RefreshTokenService.RefreshTokenResponse tokenResponse = refreshTokenService
+                        RefreshTokenResponse tokenResponse = refreshTokenServiceImpl
                                         .refreshAccessToken(refreshToken, ipAddress, userAgent);
 
-                        logger.info("Token refreshed successfully");
+                        log.info("Token refreshed successfully");
 
                         // For body-based refresh, include the new refresh token in response
                         AuthResponse authResponse = AuthResponse.builder()
@@ -345,13 +367,13 @@ public class AuthController {
 
                         return ResponseEntity.ok(authResponse);
                 } catch (SecurityException e) {
-                        logger.error("Security violation during token refresh: {}", e.getMessage());
+                        log.error("Security violation during token refresh: {}", e.getMessage());
                         return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                                         .body(AuthResponse.builder()
                                                         .error("Security violation detected - please re-authenticate")
                                                         .build());
                 } catch (Exception e) {
-                        logger.warn("Failed to refresh token: {}", e.getMessage());
+                        log.warn("Failed to refresh token: {}", e.getMessage());
                         return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
                 }
         }
@@ -401,20 +423,42 @@ public class AuthController {
          * @return ResponseEntity with logout confirmation
          */
         public ResponseEntity<Map<String, Object>> logout(HttpServletRequest request, HttpServletResponse response) {
+                String userEmail = "unknown";
+
                 // Get user ID from access token in Authorization header
                 try {
                         String accessToken = request.getHeader("Authorization");
                         if (accessToken != null && accessToken.startsWith("Bearer ")) {
                                 accessToken = accessToken.substring(7);
                                 // Extract user email from access token
-                                String email = jwtUtil.getEmailFromToken(accessToken);
-                                User user = userService.getUserByEmail(email);
+                                userEmail = jwtUtil.getEmailFromToken(accessToken);
+                                UserDto user = userServiceImpl.getUserByEmail(userEmail);
                                 // Revoke all refresh tokens for the user
-                                refreshTokenService.revokeAllUserTokens(user.getId());
-                                logger.info("All tokens revoked for user: {}", email);
+                                refreshTokenServiceImpl.revokeAllUserTokens(user.getId());
+                                // Log business event for Elasticsearch
+                                StructuredLoggingUtil.logBusinessEvent(
+                                                "USER_LOGOUT",
+                                                userEmail,
+                                                "LOGOUT",
+                                                "SUCCESS",
+                                                Map.of(
+                                                                "source", "WEB",
+                                                                "ipAddress", getClientIpAddress(request),
+                                                                "userAgent", request.getHeader("User-Agent"),
+                                                                "logoutType", "FULL_LOGOUT"));
+
+                                log.info("All tokens revoked for user: {}", LoggingUtil.maskEmail(userEmail));
+
+                                // Log authentication event asynchronously
+                                auditService.logAuthenticationEventAsync(
+                                                user.getId(),
+                                                "LOGOUT",
+                                                getClientIpAddress(request),
+                                                request.getHeader("User-Agent"),
+                                                "User logged out - all tokens revoked");
                         }
                 } catch (Exception e) {
-                        logger.warn("Could not revoke tokens during logout: {}", e.getMessage());
+                        log.warn("Could not revoke tokens during logout: {}", e.getMessage());
                 }
 
                 // Clear the refresh token cookie
@@ -428,8 +472,189 @@ public class AuthController {
 
                 response.setHeader(HttpHeaders.SET_COOKIE, clearCookie.toString());
 
-                logger.info("User logged out successfully");
+                log.info("User logged out successfully: {}", LoggingUtil.maskEmail(userEmail));
                 return ResponseEntity.ok(Map.of("message", "Logged out successfully"));
+        }
+
+        @PostMapping("/verify-email")
+        @Operation(summary = "Verify Email (Mobile App)", description = "Verify email address using verification code. Designed for mobile app integration.", requestBody = @io.swagger.v3.oas.annotations.parameters.RequestBody(description = "Email verification data", required = true, content = @Content(mediaType = "application/json", examples = @ExampleObject(name = "Verify Email", value = """
+                        {
+                          "email": "user@example.com",
+                          "code": "123456"
+                        }
+                        """))), responses = {
+                        @ApiResponse(responseCode = "200", description = "Email verified successfully"),
+                        @ApiResponse(responseCode = "400", description = "Invalid or expired verification code"),
+                        @ApiResponse(responseCode = "404", description = "User not found")
+        })
+        public ResponseEntity<Map<String, Object>> verifyEmailMobile(@RequestBody Map<String, String> request,
+                        HttpServletRequest httpRequest, HttpServletResponse response) {
+                try {
+                        String email = request.get("email");
+                        String code = request.get("code");
+
+                        if (email == null || email.trim().isEmpty()) {
+                                return ResponseEntity.badRequest().body(Map.of(
+                                                "success", false,
+                                                "message", "Email is required",
+                                                "error", "MISSING_EMAIL"));
+                        }
+
+                        if (code == null || code.trim().isEmpty()) {
+                                return ResponseEntity.badRequest().body(Map.of(
+                                                "success", false,
+                                                "message", "Verification code is required",
+                                                "error", "MISSING_CODE"));
+                        }
+
+                        log.info("Mobile email verification request received for: {} with code: {}",
+                                        LoggingUtil.maskEmail(email), LoggingUtil.maskSensitiveData(code));
+
+                        // Find user by email first
+                        User user = userServiceImpl.getUserByEmailForVerification(email);
+
+                        // Confirm email using the code
+                        User confirmedUser = userServiceImpl.confirmEmail(code);
+
+                        // Verify that the confirmed user matches the requested email
+                        if (!confirmedUser.getEmail().equals(email)) {
+                                log.warn("Email verification failed - code mismatch for: {}",
+                                                LoggingUtil.maskEmail(email));
+                                return ResponseEntity.badRequest().body(Map.of(
+                                                "success", false,
+                                                "message", "Invalid verification code for this email",
+                                                "error", "CODE_MISMATCH"));
+                        }
+
+                        // Log successful email confirmation
+                        StructuredLoggingUtil.logSecurityEvent(
+                                        "EMAIL_VERIFIED_MOBILE",
+                                        confirmedUser.getEmail(),
+                                        getClientIpAddress(httpRequest),
+                                        httpRequest.getHeader("User-Agent"),
+                                        "MEDIUM",
+                                        Map.of(
+                                                        "userId", confirmedUser.getId(),
+                                                        "username", confirmedUser.getUsername(),
+                                                        "thread", Thread.currentThread().getName()));
+
+                        // Log audit event asynchronously
+                        auditService.logSecurityEventAsync(
+                                        confirmedUser.getId(),
+                                        "EMAIL_VERIFIED_MOBILE",
+                                        "Email verified via mobile app");
+
+                        log.info("Email verified successfully via mobile app for user: {}",
+                                        LoggingUtil.maskEmail(confirmedUser.getEmail()));
+
+                        // Generate tokens after successful email verification
+                        String accessToken = userServiceImpl.generateAccessToken(confirmedUser);
+                        String refreshToken = refreshTokenServiceImpl.generateRefreshToken(
+                                        confirmedUser.getId(),
+                                        httpRequest.getHeader("User-Agent"));
+
+                        // Set refresh token as a secure cookie
+                        ResponseCookie refreshCookie = ResponseCookie.from("refreshToken", refreshToken)
+                                        .httpOnly(true)
+                                        .secure(true)
+                                        .path(ApiConfig.API_BASE_PATH)
+                                        .maxAge(Duration.ofDays(7))
+                                        .sameSite("Strict")
+                                        .build();
+
+                        response.setHeader(HttpHeaders.SET_COOKIE, refreshCookie.toString());
+
+                        return ResponseEntity.ok(Map.of(
+                                        "success", true,
+                                        "message", "Email verified successfully! You can now login.",
+                                        "data", Map.of(
+                                                        "email", confirmedUser.getEmail(),
+                                                        "username", confirmedUser.getUsername(),
+                                                        "verified", true,
+                                                        "accessToken", accessToken,
+                                                        "refreshToken", refreshToken,
+                                                        "tokenType", "Bearer",
+                                                        "expiresIn", 900L)));
+
+                } catch (UserNotFoundException e) {
+                        log.warn("Mobile email verification failed - user not found: {}", e.getMessage());
+                        return ResponseEntity.notFound().build();
+                } catch (IllegalArgumentException e) {
+                        log.warn("Mobile email verification failed - validation error: {}", e.getMessage());
+                        return ResponseEntity.badRequest().body(Map.of(
+                                        "success", false,
+                                        "message", e.getMessage(),
+                                        "error", "VALIDATION_ERROR"));
+                } catch (Exception e) {
+                        log.error("Mobile email verification failed - unexpected error: {}", e.getMessage(), e);
+                        return ResponseEntity.internalServerError().body(Map.of(
+                                        "success", false,
+                                        "message", "An unexpected error occurred",
+                                        "error", "INTERNAL_ERROR"));
+                }
+        }
+
+        @PostMapping("/resend-email-verification")
+        @Operation(summary = "Resend Email Verification", description = "Resend email verification to a user who hasn't verified their email yet.", requestBody = @io.swagger.v3.oas.annotations.parameters.RequestBody(description = "Email for verification resend", required = true, content = @Content(mediaType = "application/json", examples = @ExampleObject(name = "Resend Email Verification", value = """
+                        {
+                          "email": "john.doe@example.com"
+                        }
+                        """))), responses = {
+                        @ApiResponse(responseCode = "200", description = "Email verification resent successfully"),
+                        @ApiResponse(responseCode = "400", description = "Invalid email or email already verified"),
+                        @ApiResponse(responseCode = "404", description = "User not found")
+        })
+        public ResponseEntity<Map<String, Object>> resendEmailVerification(@RequestBody Map<String, String> request,
+                        HttpServletRequest httpRequest) {
+                try {
+                        String email = request.get("email");
+                        if (email == null || email.trim().isEmpty()) {
+                                return ResponseEntity.badRequest().body(Map.of(
+                                                "success", false,
+                                                "message", "Email is required",
+                                                "error", "MISSING_EMAIL"));
+                        }
+
+                        log.info("Email verification resend request received for: {}", LoggingUtil.maskEmail(email));
+
+                        // Resend email verification
+                        userServiceImpl.resendEmailVerification(email);
+
+                        // Log security event
+                        StructuredLoggingUtil.logSecurityEvent(
+                                        "EMAIL_VERIFICATION_RESENT",
+                                        email,
+                                        getClientIpAddress(httpRequest),
+                                        httpRequest.getHeader("User-Agent"),
+                                        "LOW",
+                                        Map.of(
+                                                        "email", LoggingUtil.maskEmail(email),
+                                                        "thread", Thread.currentThread().getName()));
+
+                        log.info("Email verification resent successfully for: {}", LoggingUtil.maskEmail(email));
+
+                        return ResponseEntity.ok(Map.of(
+                                        "success", true,
+                                        "message", "Email verification sent successfully",
+                                        "data", Map.of(
+                                                        "email", LoggingUtil.maskEmail(email))));
+
+                } catch (UserNotFoundException e) {
+                        log.warn("Email verification resend failed - user not found: {}", e.getMessage());
+                        return ResponseEntity.notFound().build();
+                } catch (IllegalArgumentException e) {
+                        log.warn("Email verification resend failed - validation error: {}", e.getMessage());
+                        return ResponseEntity.badRequest().body(Map.of(
+                                        "success", false,
+                                        "message", e.getMessage(),
+                                        "error", "VALIDATION_ERROR"));
+                } catch (Exception e) {
+                        log.error("Email verification resend failed - unexpected error: {}", e.getMessage(), e);
+                        return ResponseEntity.internalServerError().body(Map.of(
+                                        "success", false,
+                                        "message", "An unexpected error occurred",
+                                        "error", "INTERNAL_ERROR"));
+                }
         }
 
         /**
@@ -494,4 +719,67 @@ public class AuthController {
 
                 return request.getRemoteAddr();
         }
+
+        @PostMapping("/test-email")
+        @Operation(summary = "Test Email Configuration", description = "Send a test email to verify email configuration is working correctly", requestBody = @io.swagger.v3.oas.annotations.parameters.RequestBody(description = "Test email request", required = true, content = @Content(mediaType = "application/json", schema = @Schema(implementation = Map.class), examples = @ExampleObject(name = "Test Email", value = """
+                        {
+                          "email": "test@example.com"
+                        }
+                        """))), responses = {
+                        @ApiResponse(responseCode = "200", description = "Test email sent successfully"),
+                        @ApiResponse(responseCode = "400", description = "Invalid email address"),
+                        @ApiResponse(responseCode = "500", description = "Email sending failed")
+        })
+        public ResponseEntity<Map<String, Object>> testEmail(@RequestBody Map<String, String> request,
+                        HttpServletRequest httpRequest) {
+                try {
+                        String email = request.get("email");
+                        if (email == null || email.trim().isEmpty()) {
+                                return ResponseEntity.badRequest().body(Map.of(
+                                                "success", false,
+                                                "message", "Email address is required"));
+                        }
+
+                        // Validate email format
+                        String emailRegex = "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$";
+                        if (!email.matches(emailRegex)) {
+                                return ResponseEntity.badRequest().body(Map.of(
+                                                "success", false,
+                                                "message",
+                                                "Invalid email format. Please provide a valid email address."));
+                        }
+
+                        // Send simple test email instead of preview email
+                        emailService.sendSimpleEmail(email, "Test Email from AuthController",
+                                        "This is a test email from the AuthController to verify email functionality is working correctly.")
+                                        .exceptionally(throwable -> {
+                                                log.error("Failed to send test email to: {}",
+                                                                LoggingUtil.maskEmail(email), throwable);
+                                                return null;
+                                        });
+
+                        // Log the test email attempt
+                        auditService.logUserActionAsync(
+                                        email,
+                                        "EMAIL_TEST_SENT",
+                                        "Test email sent to " + LoggingUtil.maskEmail(email) + " from "
+                                                        + getClientIpAddress(httpRequest));
+
+                        log.info("Test email sent successfully to: {}", LoggingUtil.maskEmail(email));
+
+                        return ResponseEntity.ok(Map.of(
+                                        "success", true,
+                                        "message", "Test email sent successfully",
+                                        "data", Map.of(
+                                                        "email", LoggingUtil.maskEmail(email))));
+
+                } catch (Exception e) {
+                        log.error("Test email failed: {}", e.getMessage(), e);
+                        return ResponseEntity.internalServerError().body(Map.of(
+                                        "success", false,
+                                        "message", "Failed to send test email: " + e.getMessage(),
+                                        "error", "EMAIL_SEND_FAILED"));
+                }
+        }
+
 }

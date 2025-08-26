@@ -1,0 +1,150 @@
+# ========================================
+# DEBUG DOCKER COMPOSE CONFIGURATION
+# ========================================
+# This file is for running the application in IntelliJ IDE
+# It includes only the necessary supporting services (database, logging)
+# The main application will run directly in IntelliJ for easier debugging
+
+version: "3.8"
+
+services:
+  # ========================================
+  # POSTGRESQL DATABASE SERVICE
+  # ========================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: nexsplit-postgres-debug
+    environment:
+      POSTGRES_DB: nexsplit # Database name
+      POSTGRES_USER: postgres # Database username
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-Viraj@2002} # Database password from environment variable
+    ports:
+      - "5433:5432" # Expose PostgreSQL port for external access (changed to avoid conflict)
+    volumes:
+      - postgres_data_debug:/var/lib/postgresql/data # Database data persistence
+    networks:
+      - nexsplit-debug-network # Custom network for service communication
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d nexsplit"] # PostgreSQL health check command
+      interval: 10s # Check every 10 seconds
+      timeout: 5s # Wait 5 seconds for response
+      retries: 5 # Mark unhealthy after 5 failed attempts
+
+  # ========================================
+  # ELASTICSEARCH SERVICE
+  # ========================================
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: nexsplit-elasticsearch-debug
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - cluster.name=nexsplit-cluster
+      - node.name=nexsplit-node
+    ports:
+      - "9200:9200" # HTTP API
+      - "9300:9300" # Node-to-node communication
+    volumes:
+      - elasticsearch_data_debug:/usr/share/elasticsearch/data
+    networks:
+      - nexsplit-debug-network
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ========================================
+  # KIBANA SERVICE
+  # ========================================
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: nexsplit-kibana-debug
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - SERVER_NAME=nexsplit-kibana-debug
+      - SERVER_HOST=0.0.0.0
+    ports:
+      - "5601:5601" # Web interface
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - nexsplit-debug-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5601/api/status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ========================================
+  # FILEBEAT SERVICE
+  # ========================================
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.11.0
+    container_name: nexsplit-filebeat-debug
+    user: root
+    command: >
+      bash -c "
+        echo 'filebeat.inputs:' > /usr/share/filebeat/filebeat.yml &&
+        echo '  - type: log' >> /usr/share/filebeat/filebeat.yml &&
+        echo '    enabled: true' >> /usr/share/filebeat/filebeat.yml &&
+        echo '    paths:' >> /usr/share/filebeat/filebeat.yml &&
+        echo '      - /app/logs/structured-logs.json' >> /usr/share/filebeat/filebeat.yml &&
+        echo '    json.keys_under_root: true' >> /usr/share/filebeat/filebeat.yml &&
+        echo '    json.add_error_key: true' >> /usr/share/filebeat/filebeat.yml &&
+        echo '    json.message_key: message' >> /usr/share/filebeat/filebeat.yml &&
+        echo '    fields:' >> /usr/share/filebeat/filebeat.yml &&
+        echo '      application: nexsplit' >> /usr/share/filebeat/filebeat.yml &&
+        echo '      environment: debug' >> /usr/share/filebeat/filebeat.yml &&
+        echo '      log_type: structured' >> /usr/share/filebeat/filebeat.yml &&
+        echo '    fields_under_root: true' >> /usr/share/filebeat/filebeat.yml &&
+        echo '    scan_frequency: 10s' >> /usr/share/filebeat/filebeat.yml &&
+        echo 'output.elasticsearch:' >> /usr/share/filebeat/filebeat.yml &&
+        echo '  hosts: [\"elasticsearch:9200\"]' >> /usr/share/filebeat/filebeat.yml &&
+        echo '  protocol: \"http\"' >> /usr/share/filebeat/filebeat.yml &&
+        echo '  indices:' >> /usr/share/filebeat/filebeat.yml &&
+        echo '    - index: \"nexsplit-structured-%{+yyyy.MM.dd}\"' >> /usr/share/filebeat/filebeat.yml &&
+        echo '      when.contains:' >> /usr/share/filebeat/filebeat.yml &&
+        echo '        log_type: \"structured\"' >> /usr/share/filebeat/filebeat.yml &&
+        echo 'setup.kibana:' >> /usr/share/filebeat/filebeat.yml &&
+        echo '  host: \"kibana:5601\"' >> /usr/share/filebeat/filebeat.yml &&
+        echo 'setup.dashboards.enabled: true' >> /usr/share/filebeat/filebeat.yml &&
+        echo 'setup.template.enabled: true' >> /usr/share/filebeat/filebeat.yml &&
+        echo 'logging.level: info' >> /usr/share/filebeat/filebeat.yml &&
+        chmod 644 /usr/share/filebeat/filebeat.yml &&
+        filebeat -e
+      "
+    volumes:
+      - ./logs:/app/logs:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - nexsplit-debug-network
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep filebeat || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+# ========================================
+# VOLUMES
+# ========================================
+volumes:
+  postgres_data_debug: # PostgreSQL data volume for debug
+  elasticsearch_data_debug: # Elasticsearch data volume for debug
+
+# ========================================
+# NETWORKS
+# ========================================
+networks:
+  nexsplit-debug-network:
+    driver: bridge # Default bridge network driver
