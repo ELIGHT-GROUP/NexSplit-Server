@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Date;
+import java.util.UUID;
 
 @Component
 @Slf4j
@@ -31,9 +32,9 @@ public class JwtUtil {
         this.refreshTokenExpirationDays = refreshTokenExpirationDays;
     }
 
-    public String generateAccessToken(String email, String role) {
+    public String generateAccessToken(String userId, String role) {
         return Jwts.builder()
-                .subject(email)
+                .subject(userId)
                 .claim("role", role)
                 .issuedAt(Date.from(Instant.now()))
                 .expiration(Date.from(Instant.now().plus(accessTokenExpirationMinutes, ChronoUnit.MINUTES)))
@@ -41,21 +42,99 @@ public class JwtUtil {
                 .compact();
     }
 
-    public String generateRefreshToken(String email) {
+    public String generateAccessToken(String userId, String email, String role) {
         return Jwts.builder()
-                .subject(email)
+                .subject(userId)
+                .claim("email", email)
+                .claim("role", role)
+                .issuedAt(Date.from(Instant.now()))
+                .expiration(Date.from(Instant.now().plus(accessTokenExpirationMinutes, ChronoUnit.MINUTES)))
+                .signWith(secretKey)
+                .compact();
+    }
+
+    /**
+     * Generate JWT-based refresh token with enhanced security claims
+     * 
+     * SECURITY FEATURES:
+     * - Family ID for theft detection
+     * - User ID for database tracking
+     * - Token ID for unique identification
+     * - User Agent for security monitoring
+     * - Issued at and expiration for validation
+     */
+    public String generateRefreshToken(String userId, String email, String familyId, String userAgent) {
+        String tokenId = UUID.randomUUID().toString();
+
+        return Jwts.builder()
+                .id(tokenId) // Unique token identifier
+                .subject(email) // User email
+                .claim("userId", userId) // User ID for database operations
+                .claim("familyId", familyId) // Family ID for theft detection
+                .claim("userAgent", userAgent) // User agent for security monitoring
+                .claim("type", "refresh") // Token type for validation
                 .issuedAt(Date.from(Instant.now()))
                 .expiration(Date.from(Instant.now().plus(refreshTokenExpirationDays, ChronoUnit.DAYS)))
                 .signWith(secretKey)
                 .compact();
     }
 
-    public String getEmailFromToken(String token) {
+    public String getUserIdFromToken(String token) {
         return parseClaims(token).getSubject();
+    }
+
+    /**
+     * Get email from token (for backward compatibility)
+     * Note: Email is now stored as a claim, not as subject
+     */
+    public String getEmailFromToken(String token) {
+        return parseClaims(token).get("email", String.class);
     }
 
     public String getRoleFromToken(String token) {
         return parseClaims(token).get("role", String.class);
+    }
+
+    /**
+     * Extract user ID from refresh token
+     */
+    public String getUserIdFromRefreshToken(String token) {
+        return parseClaims(token).get("userId", String.class);
+    }
+
+    /**
+     * Extract family ID from refresh token
+     */
+    public String getFamilyIdFromRefreshToken(String token) {
+        return parseClaims(token).get("familyId", String.class);
+    }
+
+    /**
+     * Extract token ID from refresh token
+     */
+    public String getTokenIdFromRefreshToken(String token) {
+        return parseClaims(token).getId();
+    }
+
+    /**
+     * Extract user agent from refresh token
+     */
+    public String getUserAgentFromRefreshToken(String token) {
+        return parseClaims(token).get("userAgent", String.class);
+    }
+
+    /**
+     * Validate refresh token and check if it's the correct type
+     */
+    public boolean validateRefreshToken(String token) {
+        try {
+            Claims claims = parseClaims(token);
+            String tokenType = claims.get("type", String.class);
+            return "refresh".equals(tokenType);
+        } catch (Exception e) {
+            log.error("Refresh token validation failed: {}", e.getMessage());
+            return false;
+        }
     }
 
     public boolean validateToken(String token) {

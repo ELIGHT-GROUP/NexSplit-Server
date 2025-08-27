@@ -3,6 +3,7 @@ package com.nexsplit.config;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import java.util.concurrent.Executor;
@@ -53,43 +54,35 @@ import java.util.concurrent.Executor;
  */
 @Configuration
 @EnableAsync
+@EnableScheduling
 public class AsyncConfig {
 
     /**
      * Configure async executor using virtual threads
      * 
-     * CONFIGURATION EXPLANATION:
-     * - Core Pool Size: 10 (minimum threads always available)
-     * - Max Pool Size: 100 (maximum threads for burst traffic)
-     * - Queue Capacity: 500 (tasks waiting to be executed)
-     * - Virtual Threads: Each task gets its own virtual thread
+     * VIRTUAL THREADS IMPLEMENTATION:
+     * - Each async task gets its own virtual thread
+     * - Unlimited scalability (can handle millions of concurrent operations)
+     * - Low memory usage (~1KB per virtual thread vs ~1MB per platform thread)
+     * - Perfect for I/O-bound operations (email, HTTP, database)
      * 
-     * VIRTUAL THREAD ADVANTAGES:
-     * - Automatic scaling based on workload
-     * - No manual thread pool management needed
-     * - Better resource utilization
-     * - Reduced memory footprint
+     * HOW IT WORKS:
+     * - SimpleAsyncTaskExecutor.doExecute() is called for each task
+     * - Thread.ofVirtual().start() creates and immediately starts a virtual thread
+     * - The virtual thread executes the task and terminates when done
+     * - No thread pool management needed - JVM handles scheduling
      */
     @Bean(name = "asyncExecutor")
     public Executor asyncExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-
-        // Use virtual threads for better scalability
-        executor.setTaskDecorator(runnable -> {
-            // Create virtual thread for each task
-            // This is the key difference from platform threads
-            return Thread.ofVirtual().unstarted(runnable);
-        });
-
-        // Configure pool size for virtual threads
-        // These numbers are much higher than platform threads
-        executor.setCorePoolSize(10); // Minimum threads always running
-        executor.setMaxPoolSize(100); // Maximum threads for peak load
-        executor.setQueueCapacity(500); // Tasks waiting in queue
-        executor.setThreadNamePrefix("Async-"); // Easy identification in logs
-        executor.initialize();
-
-        return executor;
+        return new org.springframework.core.task.SimpleAsyncTaskExecutor("Async-") {
+            @Override
+            protected void doExecute(Runnable task) {
+                // Create and start virtual thread for each async task
+                Thread.ofVirtual()
+                        .name("Async-" + System.currentTimeMillis() % 10000)
+                        .start(task);
+            }
+        };
     }
 
     /**
@@ -118,5 +111,33 @@ public class AsyncConfig {
         executor.initialize();
 
         return executor;
+    }
+
+    /**
+     * Configure scheduled task executor using virtual threads
+     * 
+     * SCHEDULED TASKS WITH VIRTUAL THREADS:
+     * - Rate limit cleanup (every 5 minutes)
+     * - Database cleanup (daily)
+     * - Health checks (every minute)
+     * - Cache refresh (periodic)
+     * 
+     * BENEFITS:
+     * - Most scheduled tasks are I/O bound (perfect for virtual threads)
+     * - Better resource utilization for background operations
+     * - Automatic scaling based on task load
+     * - No thread pool management needed
+     */
+    @Bean(name = "scheduledTaskExecutor")
+    public Executor scheduledTaskExecutor() {
+        return new org.springframework.core.task.SimpleAsyncTaskExecutor("Scheduled-") {
+            @Override
+            protected void doExecute(Runnable task) {
+                // Create and start virtual thread for each scheduled task
+                Thread.ofVirtual()
+                        .name("Scheduled-" + System.currentTimeMillis() % 10000)
+                        .start(task);
+            }
+        };
     }
 }
